@@ -1,14 +1,9 @@
 class inkject {
     render(template, data = {}, delimiter = '&&') {
         const [openDelim, closeDelim] = this.parseDelimiter(delimiter);
-        const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const openPattern = escapeRegex(openDelim);
-        const closePattern = escapeRegex(closeDelim);
-
         let result = template;
-        result = this.processConditionals(result, data, openPattern, closePattern);
-        result = this.processVariables(result, data, openPattern, closePattern);
-
+        result = this.processConditionals(result, data, openDelim, closeDelim);
+        result = this.processVariables(result, data, openDelim, closeDelim);
         return result;
     }
 
@@ -22,65 +17,194 @@ class inkject {
         }
     }
 
-    processConditionals(template, data, openPattern, closePattern) {
-        const conditionalRegex = new RegExp(
-            `${openPattern}#if\\s+([^${closePattern.charAt(0)}]+?)${closePattern}([\\s\\S]*?)(?:${openPattern}#elseif\\s+([^${closePattern.charAt(0)}]+?)${closePattern}([\\s\\S]*?))*(?:${openPattern}#else${closePattern}([\\s\\S]*?))?${openPattern}/if${closePattern}`,
-            'g'
-        );
+    processConditionals(template, data, openDelim, closeDelim) {
+        let result = template;
+        let changed = true;
 
-        return template.replace(conditionalRegex, (fullMatch) => {
-            return this.processComplexConditional(fullMatch, data, openPattern, closePattern);
-        });
+        while (changed) {
+            changed = false;
+            const match = this.findInnermostConditional(result, openDelim, closeDelim);
+            if (match) {
+                const replacement = this.evaluateConditionalBlock(match.content, data, openDelim, closeDelim);
+                const beforeMatch = result.slice(0, match.start);
+                const afterMatch = result.slice(match.end);
+
+                const isInline = this.isInlineConditional(beforeMatch, afterMatch, match.content);
+
+                if (isInline) {
+                    result = beforeMatch + replacement + afterMatch;
+                } else {
+                    let cleanedReplacement = replacement.trim();
+                    let cleanedBefore = beforeMatch;
+                    let cleanedAfter = afterMatch;
+
+                    if (cleanedReplacement === '') {
+                        if (cleanedBefore.endsWith('\n')) {
+                            cleanedBefore = cleanedBefore.slice(0, -1);
+                        }
+                        if (cleanedAfter.startsWith('\n')) {
+                            cleanedAfter = cleanedAfter.slice(1);
+                        }
+                        result = cleanedBefore + cleanedAfter;
+                    } else {
+                        const needsNewlineBefore = cleanedBefore.length > 0 && !cleanedBefore.endsWith('\n') && cleanedReplacement.length > 0;
+                        const needsNewlineAfter = cleanedAfter.length > 0 && !cleanedAfter.startsWith('\n') && cleanedReplacement.length > 0;
+
+                        result = cleanedBefore +
+                            (needsNewlineBefore ? '\n' : '') +
+                            cleanedReplacement +
+                            (needsNewlineAfter ? '\n' : '') +
+                            cleanedAfter;
+                    }
+                }
+                changed = true;
+            }
+        }
+
+        return result;
     }
 
-    processComplexConditional(match, data, openPattern, closePattern) {
-        const blocks = [];
-        const ifMatch = new RegExp(`${openPattern}#if\\s+([^${closePattern.charAt(0)}]+?)${closePattern}`).exec(match);
-        if (ifMatch) {
-            blocks.push({ type: 'if', condition: ifMatch[1].trim() });
+    isInlineConditional(beforeMatch, afterMatch, conditionalContent) {
+        const beforeLastNewline = beforeMatch.lastIndexOf('\n');
+        const afterFirstNewline = afterMatch.indexOf('\n');
+
+        const beforeText = beforeLastNewline === -1 ? beforeMatch : beforeMatch.slice(beforeLastNewline + 1);
+        const afterText = afterFirstNewline === -1 ? afterMatch : afterMatch.slice(0, afterFirstNewline);
+
+        const hasContentBefore = beforeText.trim().length > 0;
+        const hasContentAfter = afterText.trim().length > 0;
+
+        const conditionalHasNewlines = conditionalContent.includes('\n');
+
+        return (hasContentBefore || hasContentAfter) && !conditionalHasNewlines;
+    }
+
+    findInnermostConditional(template, openDelim, closeDelim) {
+        const ifPattern = openDelim + '#if ';
+        const endifPattern = openDelim + '/if' + closeDelim;
+
+        let deepestIf = null;
+        let maxDepth = 0;
+
+        for (let i = 0; i < template.length; i++) {
+            if (template.substr(i, ifPattern.length) === ifPattern) {
+                let depth = 0;
+                let currentPos = i;
+                let foundMatching = false;
+
+                while (currentPos < template.length) {
+                    if (template.substr(currentPos, ifPattern.length) === ifPattern) {
+                        depth++;
+                        currentPos += ifPattern.length;
+                    } else if (template.substr(currentPos, endifPattern.length) === endifPattern) {
+                        depth--;
+                        if (depth === 0) {
+                            if (!foundMatching || depth >= maxDepth) {
+                                let hasNestedIf = false;
+                                const blockContent = template.slice(i + ifPattern.length, currentPos);
+                                if (blockContent.indexOf(ifPattern) !== -1) {
+                                    hasNestedIf = true;
+                                }
+
+                                if (!hasNestedIf) {
+                                    deepestIf = {
+                                        start: i,
+                                        end: currentPos + endifPattern.length,
+                                        content: template.slice(i, currentPos + endifPattern.length)
+                                    };
+                                    maxDepth = depth;
+                                }
+                            }
+                            foundMatching = true;
+                            break;
+                        }
+                        currentPos += endifPattern.length;
+                    } else {
+                        currentPos++;
+                    }
+                }
+            }
         }
 
-        const elseifRegex = new RegExp(`${openPattern}#elseif\\s+([^${closePattern.charAt(0)}]+?)${closePattern}`, 'g');
-        let elseifMatch;
-        while ((elseifMatch = elseifRegex.exec(match)) !== null) {
-            blocks.push({ type: 'elseif', condition: elseifMatch[1].trim() });
-        }
+        return deepestIf;
+    }
 
-        if (match.includes(`${this.unescapeRegex(openPattern)}#else${this.unescapeRegex(closePattern)}`)) {
-            blocks.push({ type: 'else' });
-        }
+    evaluateConditionalBlock(block, data, openDelim, closeDelim) {
+        const sections = this.parseConditionalSections(block, openDelim, closeDelim);
 
-        const content = this.extractConditionalContent(match, openPattern, closePattern, blocks);
-
-        for (let i = 0; i < blocks.length; i++) {
-            const block = blocks[i];
-            if (block.type === 'else' || this.evaluateCondition(block.condition, data)) {
-                return content[i] || '';
+        for (const section of sections) {
+            if (section.type === 'else' || this.evaluateCondition(section.condition, data)) {
+                return section.content;
             }
         }
 
         return '';
     }
 
-    extractConditionalContent(match, openPattern, closePattern, blocks) {
-        const unescapedOpen = this.unescapeRegex(openPattern);
-        const unescapedClose = this.unescapeRegex(closePattern);
+    parseConditionalSections(block, openDelim, closeDelim) {
+        const sections = [];
 
-        const parts = match.split(new RegExp(`${openPattern}(?:#(?:if|elseif|else)|/if)(?:\\s+[^${closePattern.charAt(0)}]*?)?${closePattern}`));
-        return parts.slice(1, -1);
+        const ifRegex = new RegExp(`^${this.escapeRegex(openDelim)}#if\\s+([^${this.escapeRegex(closeDelim)}]+)${this.escapeRegex(closeDelim)}`);
+        const elseifRegex = new RegExp(`${this.escapeRegex(openDelim)}#elseif\\s+([^${this.escapeRegex(closeDelim)}]+)${this.escapeRegex(closeDelim)}`, 'g');
+        const elseRegex = new RegExp(`${this.escapeRegex(openDelim)}#else${this.escapeRegex(closeDelim)}`);
+        const endifRegex = new RegExp(`${this.escapeRegex(openDelim)}/if${this.escapeRegex(closeDelim)}$`);
+
+        const ifMatch = block.match(ifRegex);
+        if (!ifMatch) return sections;
+
+        let content = block.replace(ifRegex, '').replace(endifRegex, '');
+        let pos = 0;
+        let currentCondition = ifMatch[1].trim();
+        let currentType = 'if';
+
+        const elseifMatches = [];
+        let elseifMatch;
+        while ((elseifMatch = elseifRegex.exec(content)) !== null) {
+            elseifMatches.push({
+                index: elseifMatch.index,
+                condition: elseifMatch[1].trim(),
+                fullMatch: elseifMatch[0]
+            });
+        }
+
+        const elseMatch = content.match(elseRegex);
+        const elsePos = elseMatch ? content.search(elseRegex) : -1;
+
+        const allBreakpoints = [
+            ...elseifMatches.map(m => ({ pos: m.index, type: 'elseif', condition: m.condition, length: m.fullMatch.length })),
+            ...(elsePos !== -1 ? [{ pos: elsePos, type: 'else', condition: null, length: elseMatch[0].length }] : [])
+        ].sort((a, b) => a.pos - b.pos);
+
+        for (let i = 0; i <= allBreakpoints.length; i++) {
+            const start = i === 0 ? 0 : allBreakpoints[i - 1].pos + allBreakpoints[i - 1].length;
+            const end = i === allBreakpoints.length ? content.length : allBreakpoints[i].pos;
+
+            const sectionContent = content.slice(start, end);
+
+            sections.push({
+                type: currentType,
+                condition: currentCondition,
+                content: sectionContent
+            });
+
+            if (i < allBreakpoints.length) {
+                currentType = allBreakpoints[i].type;
+                currentCondition = allBreakpoints[i].condition;
+            }
+        }
+
+        return sections;
     }
 
-    unescapeRegex(str) {
-        return str.replace(/\\(.)/g, '$1');
-    }
-
-    processVariables(template, data, openPattern, closePattern) {
-        const varRegex = new RegExp(`${openPattern}([^#/][^${closePattern.charAt(0)}]*?)${closePattern}`, 'g');
+    processVariables(template, data, openDelim, closeDelim) {
+        const openPattern = this.escapeRegex(openDelim);
+        const closePattern = this.escapeRegex(closeDelim);
+        const varRegex = new RegExp(`${openPattern}([^#/][^${closePattern.slice(-1)}]*)${closePattern}`, 'g');
 
         return template.replace(varRegex, (match, variable) => {
             const value = this.getValue(variable.trim(), data);
             return value !== undefined ? String(value) : '';
-        });
+        }).replace(/\n\s*\n\s*\n/g, '\n\n');
     }
 
     evaluateCondition(condition, data) {
@@ -94,8 +218,10 @@ class inkject {
 
         const operators = ['===', '!==', '==', '!=', '>=', '<=', '>', '<'];
         for (const op of operators) {
-            if (condition.includes(op)) {
-                const [left, right] = condition.split(op).map(s => s.trim());
+            const opIndex = condition.indexOf(op);
+            if (opIndex !== -1) {
+                const left = condition.slice(0, opIndex).trim();
+                const right = condition.slice(opIndex + op.length).trim();
                 const leftValue = this.getValue(left, data);
                 const rightValue = this.parseValue(right);
 
@@ -148,6 +274,10 @@ class inkject {
         if (value === 'undefined') return undefined;
 
         return value;
+    }
+
+    escapeRegex(str) {
+        return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 }
 
